@@ -10,6 +10,7 @@ It:
       2. Processes checkout.session.completed events.
       3. Builds the invoice payload.
       4. Calls the SmartBill API to create the invoice.
+      5. In TEST_MODE, automatically deletes the created invoice.
 """
 
 import json
@@ -18,7 +19,7 @@ from flask import Flask, request, jsonify
 import stripe
 from config import config, STRIPE_WEBHOOK_SECRET
 from utils import build_payload
-from smartbill import create_smartbill_invoice
+from smartbill import create_smartbill_invoice, delete_smartbill_invoice
 
 # Configure logging with timestamps.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -44,7 +45,8 @@ def stripe_webhook():
       4. For checkout.session.completed events:
            - Build the invoice payload.
            - Create the invoice via the SmartBill API.
-      5. Return a success response for handled/unhandled event types.
+           - If TEST_MODE is enabled, delete the invoice after creation.
+      5. Return a success response.
     """
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
@@ -62,6 +64,16 @@ def stripe_webhook():
         logging.info("Final Payload:\n%s", json.dumps(final_payload, indent=2))
         invoice_response = create_smartbill_invoice(final_payload)
         logging.info("SmartBill Invoice Response:\n%s", json.dumps(invoice_response, indent=2))
+
+        # In TEST_MODE, automatically delete the created invoice.
+        if config.get("TEST_MODE"):
+            invoice_number = invoice_response.get("number")  # Assumes the invoice response includes a "number" field.
+            if invoice_number:
+                deletion_result = delete_smartbill_invoice(invoice_number)
+                logging.info("Invoice deletion result: %s", deletion_result)
+            else:
+                logging.error("Invoice number not found. Cannot delete invoice in test mode.")
+
         return jsonify(success=True, invoice_response=invoice_response), 200
     else:
         logging.info("Unhandled event type: %s", event.get("type"))

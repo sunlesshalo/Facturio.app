@@ -2,14 +2,13 @@
 """
 This module contains helper functions for processing Stripe event data:
   - Extracting client details.
-  - Removing empty values from dictionaries/lists.
+  - Removing empty values.
   - Building the final invoice payload.
 
 Note: All geocoding functions have been moved to geocoding.py.
 """
 
 import logging
-import re
 from datetime import datetime, timezone
 from geocoding import resolve_county_and_city
 
@@ -70,6 +69,8 @@ def build_payload(stripe_data, config):
       5. Build product and discount details.
       6. Assemble and clean the payload.
 
+    In TEST_MODE, the payment details are omitted.
+
     Returns:
         dict: The cleaned invoice payload.
     """
@@ -91,11 +92,11 @@ def build_payload(stripe_data, config):
     # Determine if the client is a taxpayer (e.g., VAT code starts with "RO").
     is_taxpayer = client['vatCode'].startswith('RO')
 
-    # Convert the 'created' timestamp into a formatted date.
+    # Format the creation timestamp.
     issue_timestamp = stripe_data.get('created')
     issue_date = datetime.fromtimestamp(issue_timestamp, tz=timezone.utc).strftime('%Y-%m-%d')
 
-    # Build product information as required by SmartBill.
+    # Build product details.
     product = {
         'name': 'Placeholder Product',  # Replace with actual product details.
         'code': '',
@@ -167,14 +168,17 @@ def build_payload(stripe_data, config):
         "isDraft": False,      # Indicates whether the invoice is a draft.
         "dueDate": issue_date,  # For this example, due date equals issue date.
         "deliveryDate": "",     # Delivery date left empty.
-        "products": [product],   # Products must be provided as an array.
-        "payment": {
+        "products": [product],
+    }
+
+    # Only add payment details if not in test mode.
+    if not config.get("TEST_MODE"):
+        payload["payment"] = {
             "value": stripe_data.get('amount_total', 0) / 100,
             "paymentSeries": "",
             "type": "Card",
             "isCash": False
         }
-    }
 
     if discount_obj:
         payload["discount"] = discount_obj
