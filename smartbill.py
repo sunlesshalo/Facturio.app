@@ -1,39 +1,72 @@
-# File: smartbill.py
+# File: app.py
 """
-This module handles integration with the SmartBill API.
-It sends the constructed invoice payload to SmartBill for invoice creation.
+This is the main Flask application file.
+
+It:
+  - Initializes the Flask server.
+  - Defines the root endpoint.
+  - Defines the /stripe-webhook endpoint that:
+      1. Receives and verifies Stripe webhook events.
+      2. Processes checkout.session.completed events.
+      3. Builds the invoice payload.
+      4. Calls the SmartBill API to create the invoice.
 """
 
-import base64
+import json
 import logging
-import requests
-from config import config, SMARTBILL_USERNAME, SMARTBILL_TOKEN
+from flask import Flask, request, jsonify
+import stripe
+from config import config, STRIPE_WEBHOOK_SECRET
+from utils import build_payload
+from smartbill import create_smartbill_invoice
 
-def create_smartbill_invoice(invoice_payload):
+# Configure logging with timestamps.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
     """
-    Sends the invoice payload to the SmartBill API.
-
-    Steps:
-      1. Prepares HTTP headers using Basic Authentication (with encoded credentials).
-      2. Sends a POST request with the invoice payload.
-      3. Logs and returns the response.
-
-    Returns:
-        dict or None: JSON response from SmartBill if successful; otherwise, None.
+    Root route that returns a welcome message.
     """
-    # Prepare Basic Authentication credentials.
-    credentials = f"{SMARTBILL_USERNAME}:{SMARTBILL_TOKEN}"
-    encoded_credentials = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Basic {encoded_credentials}"
-    }
-    endpoint = config['SMARTBILL_INVOICE_ENDPOINT']
-    response = requests.post(endpoint, headers=headers, json=invoice_payload)
-    if response.status_code in (200, 201):
-        logging.info("Invoice created successfully in SmartBill.")
-        return response.json()
+    return "Welcome to the Stripe-SmartBill Webhook Service."
+
+@app.route("/stripe-webhook", methods=["POST"])
+def stripe_webhook():
+    """
+    Endpoint to receive and process webhook events from Stripe.
+
+    Workflow:
+      1. Retrieve the raw payload and the Stripe-Signature header.
+      2. Verify the event using Stripe's library and the webhook secret.
+      3. Log the full event details.
+      4. For checkout.session.completed events:
+           - Build the invoice payload.
+           - Create the invoice via the SmartBill API.
+      5. Return a success response for handled/unhandled event types.
+    """
+    payload = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logging.error("Webhook error: %s", e)
+        return jsonify(success=False, error=str(e)), 400
+
+    logging.info("Full Stripe event: %s", json.dumps(event, indent=2))
+
+    if event.get("type") == "checkout.session.completed":
+        session = event["data"]["object"]
+        final_payload = build_payload(session, config)
+        logging.info("Final Payload:\n%s", json.dumps(final_payload, indent=2))
+        invoice_response = create_smartbill_invoice(final_payload)
+        logging.info("SmartBill Invoice Response:\n%s", json.dumps(invoice_response, indent=2))
+        return jsonify(success=True, invoice_response=invoice_response), 200
     else:
-        logging.error("Failed to create invoice in SmartBill. Status code: %s", response.status_code)
-        logging.error("Response: %s", response.text)
-        return None
+        logging.info("Unhandled event type: %s", event.get("type"))
+        return jsonify(success=True), 200
+
+if __name__ == "__main__":
+    port = 8080
+    app.run(host="0.0.0.0", port=port)

@@ -1,98 +1,26 @@
 # File: utils.py
 """
-This module contains helper functions for:
-  - Geocoding: Resolving county and city data.
-  - Extracting client details from the Stripe event.
-  - Cleaning data by removing empty string values.
-  - Building the final invoice payload for SmartBill.
+This module contains helper functions for processing Stripe event data:
+  - Extracting client details.
+  - Removing empty values from dictionaries/lists.
+  - Building the final invoice payload.
+
+Note: All geocoding functions have been moved to geocoding.py.
 """
 
 import logging
 import re
 from datetime import datetime, timezone
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut
-
-# Create a geolocator instance with a custom user agent.
-geolocator = Nominatim(user_agent="YourAppName (your_email@example.com)")
-
-def resolve_county_and_city(client_address):
-    """
-    Determines the county and adjusts the city value based on the provided client address.
-
-    For addresses in Bucharest (Bucuresti/București):
-      - Forces county to "Bucuresti".
-      - Updates city to a specific sector if found.
-      - Uses geocoding to extract sector details if not directly provided.
-
-    For non-Bucharest addresses:
-      - Attempts geocoding if the county is missing.
-
-    Returns:
-        tuple: (county, city)
-    """
-    city = client_address.get('city', 'Unknown City')
-    country = client_address.get('country', 'Unknown Country')
-    line1 = client_address.get('line1', '')
-    line2 = client_address.get('line2', '')
-    postal_code = client_address.get('postal_code', '')
-    county = (client_address.get('state') or '').strip()
-
-    if city.lower() in ['bucuresti', 'bucurești']:
-        county = "Bucuresti"
-        sector = None
-        # Match "Sector X" (X being a number) in the address fields.
-        sector_pattern = re.compile(r'Sector\s*\d+', re.IGNORECASE)
-        for field in [line1, line2]:
-            if field:
-                match = sector_pattern.search(field)
-                if match:
-                    sector = match.group()
-                    break
-        if sector:
-            city = sector
-        else:
-            query_address = ', '.join(part for part in [line1, city, postal_code, country] if part)
-            try:
-                location = geolocator.geocode(query_address, addressdetails=True)
-                if location:
-                    logging.info("Nominatim output for Bucharest: %s", location.raw)
-                    address_data = location.raw.get('address', {})
-                    sector = address_data.get('city_district') or address_data.get('suburb')
-                    city = sector if sector else "Unknown Sector"
-                else:
-                    city = "Unknown Sector"
-            except GeocoderTimedOut:
-                logging.error("Geocoding timed out while resolving Bucharest sector.")
-                city = "Unknown Sector"
-    else:
-        if not county:
-            query_address = ', '.join(part for part in [line1, city, postal_code, country] if part)
-            try:
-                location = geolocator.geocode(query_address, addressdetails=True)
-                if location:
-                    logging.info("Nominatim output: %s", location.raw)
-                    address_data = location.raw.get('address', {})
-                    county = (address_data.get('county')
-                              or address_data.get('state')
-                              or address_data.get('region')
-                              or 'Unknown County')
-                else:
-                    county = 'Unknown County'
-            except GeocoderTimedOut:
-                logging.error("Geocoding timed out while resolving county for non-Bucharest address.")
-                county = 'Unknown County'
-    return county, city
+from geocoding import resolve_county_and_city
 
 def extract_client_details(stripe_data):
     """
-    Extracts client details from the Stripe event data, including name, email, VAT code, and address.
+    Extracts client details from the Stripe event data.
 
     Returns:
-        dict: A dictionary with keys 'name', 'email', 'vatCode', and 'address'.
+        dict: Contains keys 'name', 'email', 'vatCode', and 'address'.
     """
     logging.info("Extracting client details from stripe_data: %s", stripe_data)
-
     if not stripe_data or not isinstance(stripe_data, dict):
         logging.error("stripe_data is missing or not a dict!")
         return {
@@ -121,7 +49,7 @@ def extract_client_details(stripe_data):
 
 def remove_empty_values(data):
     """
-    Recursively removes any key-value pairs (or list items) with empty string ("") values.
+    Recursively removes key-value pairs or list items with empty string ("") values.
     """
     if isinstance(data, dict):
         return {k: remove_empty_values(v) for k, v in data.items() if v != ""}
@@ -132,24 +60,26 @@ def remove_empty_values(data):
 
 def build_payload(stripe_data, config):
     """
-    Constructs the final invoice payload to be sent to SmartBill.
+    Constructs the final invoice payload for SmartBill using the Stripe event data.
 
     Steps:
-      1. Extract client details from the Stripe event.
-      2. Use geocoding to resolve/adjust county and city data.
+      1. Extract client details.
+      2. Resolve county and city using the geocoding module.
       3. Build the full client address.
-      4. Format the event timestamp into a date string.
-      5. Build product information (and discount, if applicable).
-      6. Assemble and clean the complete payload.
+      4. Format the event's creation timestamp.
+      5. Build product and discount details.
+      6. Assemble and clean the payload.
 
     Returns:
-        dict: The cleaned payload formatted for SmartBill.
+        dict: The cleaned invoice payload.
     """
     client = extract_client_details(stripe_data)
     client_address = client.get('address', {})
+
+    # Resolve county and city using the geocoding functions.
     county, city = resolve_county_and_city(client_address)
 
-    # Build the full address by combining available address parts.
+    # Build the full address from available parts.
     address_parts = [
         client_address.get('line1', ''),
         client_address.get('line2', ''),
@@ -161,7 +91,7 @@ def build_payload(stripe_data, config):
     # Determine if the client is a taxpayer (e.g., VAT code starts with "RO").
     is_taxpayer = client['vatCode'].startswith('RO')
 
-    # Convert the 'created' timestamp to a formatted date string.
+    # Convert the 'created' timestamp into a formatted date.
     issue_timestamp = stripe_data.get('created')
     issue_date = datetime.fromtimestamp(issue_timestamp, tz=timezone.utc).strftime('%Y-%m-%d')
 
@@ -182,17 +112,16 @@ def build_payload(stripe_data, config):
         'isService': config['isService']
     }
 
-    # Process discount information if available.
     discount_obj = None
     if stripe_data.get('discounts'):
         for discount in stripe_data['discounts']:
             promotion_code_id = discount.get('promotion_code')
             if promotion_code_id:
-                # For demonstration purposes, create a placeholder promotion code.
+                # For demonstration, create a placeholder promotion code.
                 promotion_code = {
                     'code': 'PROMO123',
                     'coupon': {
-                        'percent_off': 10,   # Example: 10% discount.
+                        'percent_off': 10,  # Example: 10% discount.
                         'amount_off': None
                     }
                 }
@@ -220,7 +149,6 @@ def build_payload(stripe_data, config):
                 }
                 break
 
-    # Assemble the payload.
     payload = {
         "companyVatCode": config['companyVatCode'],
         "client": {
@@ -248,10 +176,8 @@ def build_payload(stripe_data, config):
         }
     }
 
-    # Add discount information if applicable.
     if discount_obj:
         payload["discount"] = discount_obj
 
-    # Remove keys with empty string values.
     payload = remove_empty_values(payload)
     return payload
