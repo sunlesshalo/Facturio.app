@@ -1,7 +1,7 @@
 # File: email_sender.py
 """
-This module sends invoice emails using SMTP. It expects an invoice payload with email-related
-fields, including base64-encoded subject and body text. For now, this is tailored for our company's use.
+This module sends invoice emails using SMTP with detailed logging.
+It expects invoice payload fields for base64-encoded subject and body.
 """
 
 import os
@@ -17,28 +17,10 @@ logger.setLevel(logging.DEBUG)
 def send_invoice_email(invoice_payload):
     """
     Sends an invoice email using SMTP.
-
-    The invoice_payload dictionary should contain:
-      - companyVatCode: e.g., "RO12345678"
-      - seriesName: e.g., "seriesname"
-      - number: e.g., "invoicenumber"
-      - type: e.g., "factura"
-      - subject: Base64EncodedSubject
-      - to: recipient email address (from Stripe event details)
-      - bodyText: Base64EncodedBody
-      - emailConfig: {
-            "mailFrom": <sender email from env var SMARTBILL_USERNAME>,
-            "password": <app password from env var APP_PASSWORD>,
-            "smtpServer": "smtp.gmail.com",
-            "smtpPort": 587,
-            "useTLS": true
-        }
-
-    Returns True if email is sent successfully; raises an exception otherwise.
+    Expects the invoice_payload to contain emailConfig details.
     """
     try:
         email_config = invoice_payload.get("emailConfig", {})
-        # Ensure we have the necessary configuration:
         mail_from = email_config.get("mailFrom") or os.environ.get("SMARTBILL_USERNAME")
         password = email_config.get("password") or os.environ.get("APP_PASSWORD")
         smtp_server = email_config.get("smtpServer", "smtp.gmail.com")
@@ -54,29 +36,23 @@ def send_invoice_email(invoice_payload):
         if not subject_encoded or not body_text_encoded:
             raise ValueError("Email subject or body is missing.")
 
-        # Decode Base64 subject and body
-        try:
-            subject = base64.b64decode(subject_encoded).decode("utf-8")
-            body_text = base64.b64decode(body_text_encoded).decode("utf-8")
-        except Exception as decode_err:
-            logger.exception("Failed to decode subject or body: %s", decode_err)
-            raise
+        logger.debug("Decoding email subject and body.")
+        subject = base64.b64decode(subject_encoded).decode("utf-8")
+        body_text = base64.b64decode(body_text_encoded).decode("utf-8")
 
-        # Build the email message.
         msg = MIMEMultipart()
         msg["From"] = mail_from
         msg["To"] = recipient
         msg["Subject"] = subject
         msg.attach(MIMEText(body_text, "plain"))
 
-        logger.debug("Prepared email message: From=%s, To=%s, Subject=%s", mail_from, recipient, subject)
-
-        # Connect to SMTP server.
+        logger.debug("Connecting to SMTP server: %s:%s", smtp_server, smtp_port)
         server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
         server.ehlo()
         if use_tls:
             server.starttls()
             server.ehlo()
+        logger.debug("Logging in as %s.", mail_from)
         server.login(mail_from, password)
         server.sendmail(mail_from, recipient, msg.as_string())
         server.quit()
