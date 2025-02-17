@@ -1,15 +1,7 @@
 # File: app.py
 """
-This is the main Flask application file.
-
-It:
-  - Initializes the Flask server.
-  - Defines the root endpoint.
-  - Defines the /stripe-webhook endpoint that:
-      1. Receives and verifies Stripe webhook events.
-      2. Processes checkout.session.completed events.
-      3. Builds the invoice payload.
-      4. Calls the SmartBill API to create the invoice.
+Main Flask application file with enhanced error handling, retries, logging,
+notifications, and idempotency checks using Replit DB.
 """
 
 import json
@@ -18,57 +10,65 @@ from flask import Flask, request, jsonify
 import stripe
 from config import config, STRIPE_WEBHOOK_SECRET
 from utils import build_payload
-from smartbill import create_smartbill_invoice
+from smartbill import create_smartbill_invoice, delete_smartbill_invoice
+from idempotency import is_event_processed, mark_event_processed, remove_event
+from notifications import notify_admin
 
-# Configure logging to include timestamps.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure logging – in production you might configure logging to a file or an external system.
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Initialize Flask app.
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    """
-    Root route that returns a welcome message.
-    """
-    return "Welcome to the Stripe-SmartBill Webhook Service."
+    return "Welcome to Facturio's Stripe-SmartBill Integration Service."
 
 @app.route("/stripe-webhook", methods=["POST"])
 def stripe_webhook():
-    """
-    Endpoint to receive and process webhook events from Stripe.
-
-    Workflow:
-      1. Retrieve the raw payload and the Stripe-Signature header.
-      2. Verify the event using Stripe's library and the webhook secret.
-      3. Log the full event details.
-      4. For checkout.session.completed events:
-           - Build the invoice payload.
-           - Create the invoice via the SmartBill API.
-      5. Return a success response for handled/unhandled event types.
-    """
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        logging.error("Webhook error: %s", e)
-        return jsonify(success=False, error=str(e)), 400
+        logger.error("Webhook signature verification failed: %s", e)
+        return jsonify(success=False, error="Invalid signature"), 400
 
-    logging.info("Full Stripe event: %s", json.dumps(event, indent=2))
+    # Use Replit DB for idempotency: check if the event was already processed.
+    event_id = event.get("id")
+    if is_event_processed(event_id):
+        logger.info("Duplicate event received: %s. Ignoring.", event_id)
+        return jsonify(success=True, message="Duplicate event"), 200
 
-    if event.get("type") == "checkout.session.completed":
-        session = event["data"]["object"]
-        final_payload = build_payload(session, config)
-        logging.info("Final Payload:\n%s", json.dumps(final_payload, indent=2))
-        invoice_response = create_smartbill_invoice(final_payload)
-        logging.info("SmartBill Invoice Response:\n%s", json.dumps(invoice_response, indent=2))
-        return jsonify(success=True, invoice_response=invoice_response), 200
-    else:
-        logging.info("Unhandled event type: %s", event.get("type"))
-        return jsonify(success=True), 200
+    # Mark event as processed.
+    mark_event_processed(event_id)
+
+    try:
+        if event.get("type") == "checkout.session.completed":
+            session = event["data"]["object"]
+            final_payload = build_payload(session, config)
+            logger.info("Final payload built: %s", json.dumps(final_payload, indent=2))
+            invoice_response = create_smartbill_invoice(final_payload)
+            logger.info("SmartBill Invoice Response: %s", json.dumps(invoice_response, indent=2))
+            if config.get("TEST_MODE"):
+                invoice_number = invoice_response.get("number")
+                if invoice_number:
+                    deletion_result = delete_smartbill_invoice(invoice_number)
+                    logger.info("Invoice deletion result: %s", deletion_result)
+                else:
+                    logger.error("No invoice number found; cannot delete invoice in test mode.")
+        else:
+            logger.info("Unhandled event type: %s", event.get("type"))
+    except Exception as e:
+        logger.exception("Error processing event %s: %s", event_id, e)
+        notify_admin(e)
+        # Remove the event from idempotency store to allow reprocessing.
+        remove_event(event_id)
+        return jsonify(success=False, error="Internal server error"), 500
+
+    return jsonify(success=True), 200
 
 if __name__ == "__main__":
-    # Start the Flask development server.
     port = 8080
     app.run(host="0.0.0.0", port=port)

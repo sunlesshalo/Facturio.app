@@ -2,3 +2,5 @@ requests>=2.0.0
 geopy>=2.0.0
 flask
 stripe
+replit
+tenacity

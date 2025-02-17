@@ -1,84 +1,61 @@
-# File: app.py
+# File: smartbill.py
 """
-This is the main Flask application file.
-
-It:
-  - Initializes the Flask server.
-  - Defines the root endpoint.
-  - Defines the /stripe-webhook endpoint that:
-      1. Receives and verifies Stripe webhook events.
-      2. Processes checkout.session.completed events.
-      3. Builds the invoice payload.
-      4. Calls the SmartBill API to create the invoice.
-      5. In TEST_MODE, automatically deletes the created invoice.
+Enhanced SmartBill integration with retries and logging.
 """
 
-import json
+import base64
 import logging
-from flask import Flask, request, jsonify
-import stripe
-from config import config, STRIPE_WEBHOOK_SECRET
-from utils import build_payload
-from smartbill import create_smartbill_invoice, delete_smartbill_invoice
+import requests
+from config import config, SMARTBILL_USERNAME, SMARTBILL_TOKEN
+from tenacity import retry, wait_exponential, stop_after_attempt
 
-# Configure logging with timestamps.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-
-@app.route("/")
-def index():
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(5), reraise=True)
+def create_smartbill_invoice(invoice_payload):
     """
-    Root route that returns a welcome message.
+    Sends the invoice payload to the SmartBill API.
+    Retries on transient errors.
     """
-    return "Welcome to the Stripe-SmartBill Webhook Service."
-
-@app.route("/stripe-webhook", methods=["POST"])
-def stripe_webhook():
-    """
-    Endpoint to receive and process webhook events from Stripe.
-
-    Workflow:
-      1. Retrieve the raw payload and the Stripe-Signature header.
-      2. Verify the event using Stripe's library and the webhook secret.
-      3. Log the full event details.
-      4. For checkout.session.completed events:
-           - Build the invoice payload.
-           - Create the invoice via the SmartBill API.
-           - If TEST_MODE is enabled, delete the invoice after creation.
-      5. Return a success response.
-    """
-    payload = request.get_data()
-    sig_header = request.headers.get("Stripe-Signature")
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except Exception as e:
-        logging.error("Webhook error: %s", e)
-        return jsonify(success=False, error=str(e)), 400
-
-    logging.info("Full Stripe event: %s", json.dumps(event, indent=2))
-
-    if event.get("type") == "checkout.session.completed":
-        session = event["data"]["object"]
-        final_payload = build_payload(session, config)
-        logging.info("Final Payload:\n%s", json.dumps(final_payload, indent=2))
-        invoice_response = create_smartbill_invoice(final_payload)
-        logging.info("SmartBill Invoice Response:\n%s", json.dumps(invoice_response, indent=2))
-
-        # In TEST_MODE, automatically delete the created invoice.
-        if config.get("TEST_MODE"):
-            invoice_number = invoice_response.get("number")  # Assumes the invoice response includes a "number" field.
-            if invoice_number:
-                deletion_result = delete_smartbill_invoice(invoice_number)
-                logging.info("Invoice deletion result: %s", deletion_result)
-            else:
-                logging.error("Invoice number not found. Cannot delete invoice in test mode.")
-
-        return jsonify(success=True, invoice_response=invoice_response), 200
+    credentials = f"{SMARTBILL_USERNAME}:{SMARTBILL_TOKEN}"
+    encoded_credentials = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {encoded_credentials}"
+    }
+    endpoint = config['SMARTBILL_INVOICE_ENDPOINT']
+    response = requests.post(endpoint, headers=headers, json=invoice_payload)
+    if response.status_code in (200, 201):
+        logger.info("Invoice created successfully in SmartBill.")
+        return response.json()
     else:
-        logging.info("Unhandled event type: %s", event.get("type"))
-        return jsonify(success=True), 200
+        logger.error("Failed to create invoice. Status code: %s, Response: %s",
+                     response.status_code, response.text)
+        response.raise_for_status()
 
-if __name__ == "__main__":
-    port = 8080
-    app.run(host="0.0.0.0", port=port)
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(5), reraise=True)
+def delete_smartbill_invoice(invoice_number):
+    """
+    Deletes an invoice in SmartBill.
+    Retries on transient errors.
+    """
+    cif = config['companyVatCode']
+    seriesName = config['seriesName']
+    # Use lowercase 'seriesname' as required by SmartBill
+    url = f"https://ws.smartbill.ro/SBORO/api/invoice?cif={cif}&seriesname={seriesName}&number={invoice_number}"
+    credentials = f"{SMARTBILL_USERNAME}:{SMARTBILL_TOKEN}"
+    encoded_credentials = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+    headers = {
+         "Content-Type": "application/json",
+         "Authorization": f"Basic {encoded_credentials}"
+    }
+    logger.debug("Deleting invoice at URL: %s with headers: %s", url, headers)
+    response = requests.delete(url, headers=headers)
+    if response.status_code in (200, 201):
+         logger.info("Invoice %s deleted successfully.", invoice_number)
+         return response.json()
+    else:
+         logger.error("Failed to delete invoice %s. Status code: %s, Response: %s",
+                      invoice_number, response.status_code, response.text)
+         response.raise_for_status()
+
